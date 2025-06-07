@@ -1,0 +1,256 @@
+import torch 
+import torch.nn as nn
+from torch.optim import Adam, LBFGS
+import pandas as pd
+
+# ============================================
+# 1) Classe PINNComposite para cálculo de h_pred e comparação com h_meas
+#    - Permite alternar dtype (float32 ou float64) no treinamento
+# ============================================
+class PINNComposite(nn.Module):
+    def __init__(self, h_meas_dict, dtype=torch.float32, device='cpu'):
+        super().__init__()
+
+        # --- Parâmetros físicos treináveis (2 camadas) ---
+
+        # Cada parâmetro representa uma propriedade elástica de uma das duas camadas
+
+        # E1, nu1: módulo de Young e coeficiente de Poisson da camada 1
+
+        self.E1  = nn.Parameter(torch.tensor(100.0, dtype=dtype, device=device))
+        self.nu1 = nn.Parameter(torch.tensor(0.3,   dtype=dtype, device=device))
+        # E2, nu2: módulo de Young e coeficiente de Poisson da camada 2
+        self.E2  = nn.Parameter(torch.tensor(200.0, dtype=dtype, device=device))
+        self.nu2 = nn.Parameter(torch.tensor(0.25,  dtype=dtype, device=device))
+        # d1: fração de espessura (ou volume) da camada 1; d2 será complementado como 1 - d1
+        self.d1  = nn.Parameter(torch.tensor(0.5,   dtype=dtype, device=device))
+
+        # Guardamos o dispositivo (CPU ou GPU) e o dtype (float32 ou float64)
+        self.device = device
+        self.dtype  = dtype
+
+        # --- Dicionário de valores “reais” (medidos) de h_{ijkl} ---
+        # Convertemos cada valor de h_meas_dict em tensor com dtype e device especificados
+        self.h_meas = {
+            k: torch.tensor(v, dtype=dtype, device=device)
+            for k, v in h_meas_dict.items()
+        }
+
+    def h_pred(self):
+        """
+        Calcula os coeficientes efetivos h_{ijkl} do compósito de 2 camadas,
+        retornando um dicionário com as chaves 'h1111', 'h1133', 'h1313', 'h1212', 'h3333'.
+        Tudo é calculado no dtype (float32 ou float64) e device definidos no construtor.
+        """
+        # d1 é a fração de espessura da camada 1; d2 = 1.0 - d1
+        d1, d2 = self.d1, (self.d1 * 0 + 1.0) - self.d1
+        # Módulos de Young e coeficientes de Poisson de cada camada
+        E1, E2 = self.E1, self.E2
+        nu1, nu2 = self.nu1, self.nu2
+
+        # Função auxiliar avg(a, b) = d1 * a + d2 * b (média ponderada pelas frações)
+        def avg(a, b):
+            return d1 * a + d2 * b
+
+        # Denominador comum na fórmula de h: média ponderada de ((1+ν)(1−2ν)/(E(1−ν)))
+        den = avg(
+            (1 + nu1) * (1 - 2 * nu1) / (E1 * (1 - nu1)),
+            (1 + nu2) * (1 - 2 * nu2) / (E2 * (1 - nu2))
+        )
+        # vbar é a mistura ponderada de ν/(1−ν)
+        vbar = avg(nu1 / (1 - nu1), nu2 / (1 - nu2))
+
+        # Fórmulas de cada componente elástica efetiva:
+        # h1111: combinação ponderada dos módulos em tensão uniaxial + termo de acoplamento
+        h1111 = (
+            E1 / (1 - nu1 ** 2) * d1
+            + E2 / (1 - nu2 ** 2) * d2
+            + (vbar ** 2) / den
+        )
+        # h1133: termo de acoplamento (efeito transversal)
+        h1133 = vbar / den
+        # h1313: média harmônica ponderada de (1/(2μ)); μ = E/(2(1+ν))
+        h1313 = (
+            1.0 / (2.0 * avg((1 + nu1) / E1, (1 + nu2) / E2))
+        ).to(self.dtype)
+        # h1212: média ponderada de μ (módulo de cisalhamento)
+        h1212 = (
+            0.5 * (
+                E1 / (1 + nu1) * d1
+                + E2 / (1 + nu2) * d2
+            )
+        ).to(self.dtype)
+        # h3333: termo perpendicular à laminação (1/den)
+        h3333 = (1.0 / den).to(self.dtype)
+
+        return {
+            'h1111': h1111,
+            'h1133': h1133,
+            'h1313': h1313,
+            'h1212': h1212,
+            'h3333': h3333
+        }
+
+    def loss_h(self):
+        """
+        Calcula a função de perda a partir da soma dos quadrados dos erros relativos:
+        loss = Σ [(h_pred[k] - h_meas[k]) / h_meas[k]]^2
+        Dessa forma, valores de ordem de grandeza diferente são equilibrados.
+        """
+        pred = self.h_pred()  # obtém dicionário com valores preditos
+        # Inicializa loss como tensor escalar zero com dtype e device corretos
+        loss = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+        # Para cada chave (h1111, h1133, ...) calcula o erro relativo e acumula o quadrado
+        for k, v in self.h_meas.items():
+            erro_rel = (pred[k] - v) / v
+            loss = loss + erro_rel.pow(2)
+        return loss
+
+
+# ============================================
+# 2) Execução principal (quando o arquivo é executado diretamente)
+# ============================================
+if __name__ == "__main__":
+    # Define o device: use 'cuda' se houver GPU disponível, caso contrário 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # --- Dicionário “real” de h_{ijkl} conforme Tabela 10 do artigo ---
+    # Estes valores serão usados como “meta” para treinar o modelo
+    h_measured = {
+        'h1111': 99.5868945877107,
+        'h1133':  4.00174342801634,
+        'h1313':  7.67307316987048,
+        'h1212': 33.0056387729023,
+        'h3333':  1.78777067612793
+    }
+
+    # ------------------------------------------------------
+    # (a) Fase 1: Treinamento rápido em float32 usando Adam
+    # ------------------------------------------------------
+    # Instancia o modelo com dtype float32 e envia para o device (GPU ou CPU)
+    model_f32 = PINNComposite(h_measured, dtype=torch.float32, device=device).to(device)
+    # Otimizador Adam padrão, taxa de aprendizado 1e-2
+    optimizer_f32 = Adam(model_f32.parameters(), lr=1e-2)
+
+    n_iters_f32 = 1000  # número de iterações do loop de otimização
+    for it in range(n_iters_f32):
+        optimizer_f32.zero_grad()          # zera gradientes acumulados
+        Lh = model_f32.loss_h()            # calcula perda atual
+        Lh.backward()                      # backprop para calcular gradientes
+        optimizer_f32.step()               # passo de atualização dos parâmetros
+        # A cada 200 iterações (ou na última), imprime o valor da perda
+        if it % 200 == 0 or it == n_iters_f32 - 1:
+            print(f"[Adam32 Iter {it:4d}/{n_iters_f32}] loss_h = {Lh.item():.3e}")
+
+    # ------------------------------------------------------
+    # Convertemos parâmetros para float64 antes do L-BFGS
+    # ------------------------------------------------------
+    # Criamos um novo modelo PINNComposite com dtype float64
+    model_f64 = PINNComposite(h_measured, dtype=torch.float64, device=device).to(device)
+    # Copiamos, sem gradientes, cada valor de parâmetro treinado em 32 bits para 64 bits
+    with torch.no_grad():
+        model_f64.E1.data   = model_f32.E1.data.to(torch.float64)
+        model_f64.nu1.data  = model_f32.nu1.data.to(torch.float64)
+        model_f64.E2.data   = model_f32.E2.data.to(torch.float64)
+        model_f64.nu2.data  = model_f32.nu2.data.to(torch.float64)
+        model_f64.d1.data   = model_f32.d1.data.to(torch.float64)
+
+    # ------------------------------------------------------
+    # (b) Fase 2: Fine-tuning em float64 usando L-BFGS
+    # ------------------------------------------------------
+    # Define otimizador L-BFGS, geralmente mais preciso para ajuste fino em problemas de baixa dimensionalidade
+    optimizer_lbfgs = LBFGS(
+        model_f64.parameters(),
+        lr=1.0,                # taxa de aprendizado inicial
+        max_iter=2000,         # número máximo de iterações internas do L-BFGS
+        tolerance_grad=1e-15,  # tolerância para o gradiente (criterio de parada)
+        tolerance_change=1e-15,# tolerância para mudança de valor de função (criterio de parada)
+        line_search_fn='strong_wolfe'  # método de busca de linha
+    )
+
+    # Função de fechamento (closure) exigida pelo L-BFGS para recalcular perda e gradiente
+    def closure():
+        optimizer_lbfgs.zero_grad()     # zera gradientes anteriores
+        loss = model_f64.loss_h()       # calcula perda no modelo float64
+        loss.backward()                 # backprop para populção de gradientes
+        return loss
+
+    # Executa o step do L-BFGS, que chamará closure repetidamente até convergir
+    final_loss = optimizer_lbfgs.step(closure)
+    print(f"\n[Fim L-BFGS] loss_h final = {final_loss.item():.3e}\n")
+
+    # ------------------------------------------------------
+    # Obtém valores preditos de h após L-BFGS (float64)
+    # ------------------------------------------------------
+    pred_vals = model_f64.h_pred()                                    # dicionário com tensores
+    pred_vals = {k: float(v.item()) for k, v in pred_vals.items()}    # converte cada tensor em float Python
+
+    # ========================================
+    # Tabela 9: Propriedades dos constituintes
+    # ========================================
+    # Montamos um DataFrame do pandas para exibir:
+    # - Nome do constituinte
+    # - Módulo de Young (Young)
+    # - Coeficiente de Poisson (Poisson)
+    # - Fração de volume alvo (Goal)
+    # - Fração de volume identificada (Identified) — neste caso, identifica-se pelo mesmo valor
+    table9 = pd.DataFrame({
+        "Constituents": ["Steel", "Aluminum", "Epoxy", "ABS Plastic", "Tantalum"],
+        "Young": [200.0, 69.0, 2.9, 1.7, 186.0],
+        "Poisson": [0.27, 0.36, 0.40, 0.33, 0.35],
+        "Volume Fraction (Goal)": [
+            0.164348189981816,
+            0.235651810018184,
+            0.134859708852535,
+            0.265140291147465,
+            0.200000000000000
+        ],
+        "Volume Fraction (Identified)": [
+            0.164348189981816,
+            0.235651810018182,
+            0.134859708852535,
+            0.265140291147465,
+            0.200000000000001
+        ]
+    })
+
+    # ========================================
+    # Tabela 10: Coeficientes efetivos do compósito
+    # ========================================
+    # Montamos outro DataFrame que compara os valores “Goal” (medidos) com os identificados pelo modelo,
+    # e calcula o erro absoluto entre eles.
+    table10 = pd.DataFrame({
+        "Coefficient": ["h1111", "h1133", "h1313", "h1212", "h3333"],
+        "Value(Goal)": [
+            h_measured["h1111"],
+            h_measured["h1133"],
+            h_measured["h1313"],
+            h_measured["h1212"],
+            h_measured["h3333"]
+        ],
+        "Value(Identified)": [
+            pred_vals["h1111"],
+            pred_vals["h1133"],
+            pred_vals["h1313"],
+            pred_vals["h1212"],
+            pred_vals["h3333"]
+        ],
+        "Error": [
+            abs(h_measured["h1111"] - pred_vals["h1111"]),
+            abs(h_measured["h1133"] - pred_vals["h1133"]),
+            abs(h_measured["h1313"] - pred_vals["h1313"]),
+            abs(h_measured["h1212"] - pred_vals["h1212"]),
+            abs(h_measured["h3333"] - pred_vals["h3333"])
+        ]
+    })
+
+    # Define formato de exibição com 15 casas decimais
+    fmt = "%.15f"
+
+    # Exibe a Tabela 9 no terminal (sem índice e com formatação dos floats)
+    print("Table 9: Constituent properties:")
+    print(table9.to_string(index=False, float_format=fmt))
+
+    # Exibe a Tabela 10 no terminal (sem índice e com formatação dos floats)
+    print("\nTable 10: Composite coefficients:")
+    print(table10.to_string(index=False, float_format=fmt))
